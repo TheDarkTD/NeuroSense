@@ -1,4 +1,6 @@
 import sys
+import math
+import colorsys
 import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -10,7 +12,6 @@ import firebase_admin
 from firebase_admin import credentials, db
 from PIL import Image
 from scipy.ndimage import gaussian_filter
-import colorsys
 
 # =========================
 # CONFIG / CALIBRAÇÃO
@@ -24,10 +25,8 @@ LOGO_IMG = "feet.png"
 CANVAS_W, CANVAS_H = 340, 450
 SIGMA, GAMMA = 60, 0.7
 
-# Calibração: 1000 ADC ≈ 67.6 kPa (ponto medido)
-KPA_PER_UNIT = 67.6 / 1000.0          # ≈ 0.0676 kPa por ADC
-LEGEND_MAX_KPA = 280.0                # topo da escala/legenda (ajustável)
-LEGEND_TICKS_KPA = [0, 70, 140, 210, 280]  # marcas da legenda
+# Calibração informada: 1000 ADC ≈ 67.6 kPa
+KPA_PER_UNIT = 67.6 / 1000.0  # ≈ 0.0676 kPa por unidade ADC
 
 # Posições normalizadas (pé direito). Pé esquerdo é espelhado em X.
 SENSOR_POS_RIGHT = {
@@ -36,7 +35,7 @@ SENSOR_POS_RIGHT = {
     "SR7": (0.51, 0.72), "SR8": (0.49, 0.85), "SR9": (0.34, 0.85),
 }
 
-# Nomes das regiões (ajuste livre se quiser)
+# Nomes das regiões plantares por sensor (ajuste livre)
 SR_NAMES = {
     "SR1": "Hálux (dedão)",
     "SR2": "Metatarso medial",
@@ -131,94 +130,76 @@ def expand_coleta(uid, date_str, coleta_id, side="R"):
     return frames
 
 # =========================
-# HEATMAP (kPa ABSOLUTO)
+# HEATMAP
 # =========================
 def render_heatmap(sr_vals, foot_side="right"):
-    """
-    Renderiza heatmap com escala ABSOLUTA em kPa.
-    Cores (azul->vermelho) correspondem a 0 .. LEGEND_MAX_KPA.
-    """
-    # grade em ADC (0..4095)
-    canvas_adc = np.zeros((CANVAS_H, CANVAS_W), dtype=np.float32)
-    coords = SENSOR_POS_RIGHT if foot_side == "right" else {k: (1-x, y) for k, (x, y) in SENSOR_POS_RIGHT.items()}
-
-    for i in range(1, 10):
+    canvas = np.zeros((CANVAS_H, CANVAS_W), dtype=np.float32)
+    coords = SENSOR_POS_RIGHT if foot_side=="right" else {k:(1-x,y) for k,(x,y) in SENSOR_POS_RIGHT.items()}
+    for i in range(1,10):
         v = sr_vals.get(f"SR{i}")
-        if np.isnan(v): 
-            continue
-        x = int(coords[f"SR{i}"][0] * CANVAS_W)
-        y = int(coords[f"SR{i}"][1] * CANVAS_H)
-        canvas_adc[y, x] = v  # valor cru
-
-    # suaviza (ADC) e converte para kPa ABSOLUTO
-    heat_adc = gaussian_filter(canvas_adc, sigma=SIGMA)
-    heat_kpa = heat_adc * KPA_PER_UNIT
-
-    # normaliza pela faixa ABSOLUTA (0..LEGEND_MAX_KPA) para colorização
-    norm = np.clip(heat_kpa / max(LEGEND_MAX_KPA, 1e-6), 0.0, 1.0)
-    frac = norm ** GAMMA
-
-    # mapeamento HSV (240->0)
-    hue = (1.0 - frac) * 240.0
-    h = hue / 360.0
-    s = np.ones_like(hue)
-    v = np.ones_like(hue)
-
-    i = (h * 6.0).astype(int) % 6
-    f = (h * 6.0) - i
-    p = v * (1 - s)
-    q = v * (1 - f * s)
-    t = v * (1 - (1 - f) * s)
-
-    r = np.choose(i, [v, q, p, p, t, v])
-    g = np.choose(i, [t, v, v, q, p, p])
-    b = np.choose(i, [p, p, t, v, v, q])
-
-    r = (r * 255).astype(np.uint8)
-    g = (g * 255).astype(np.uint8)
-    b = (b * 255).astype(np.uint8)
-
-    # ---- Alpha proporcional à intensidade absoluta ----
-    # frac é 0..1 (kPa normalizado pela legenda). Usamos um leve expoente para
-    # dar contraste e zeramos opacidade quando for muito baixo.
-    frac_alpha = np.clip(frac**1.2, 0.0, 1.0)
-    alpha = (255 * frac_alpha).astype(np.uint8)
-
-    # Remove totalmente ruído (não “azula” o pé inteiro)
-    alpha[frac < 0.02] = 0
-
-    return np.dstack([r, g, b, alpha])
+        if np.isnan(v): continue
+        x = int(coords[f"SR{i}"][0]*CANVAS_W); y = int(coords[f"SR{i}"][1]*CANVAS_H)
+        canvas[y, x] = v
+    heatmap = gaussian_filter(canvas, sigma=SIGMA)
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
+    heatmap = heatmap ** GAMMA
+    frac = heatmap ** 0.8
+    hue = (1 - frac) * 240
+    h = hue / 360.0; s = np.ones_like(hue); v = np.ones_like(hue)
+    i = (h*6.0).astype(int); f = (h*6.0) - i; i = i % 6
+    p = v*(1-s); q = v*(1-f*s); t = v*(1-(1-f)*s)
+    r = np.choose(i,[v,q,p,p,t,v]); g = np.choose(i,[t,v,v,q,p,p]); b = np.choose(i,[p,p,t,v,v,q])
+    r=(r*255).astype(np.uint8); g=(g*255).astype(np.uint8); b=(b*255).astype(np.uint8)
+    alpha=(180+75*frac).astype(np.uint8)
+    return np.dstack([r,g,b,alpha])
 
 # =========================
 # AUX: pico de pressão
 # =========================
 def max_pressure_info(payload):
     sr_vals = payload["sr_vals"]
-    max_sr = None
-    max_adc = -1
+    max_sr = None; max_adc = -1
     for i in range(1, 10):
         key = f"SR{i}"
         v = sr_vals.get(key, np.nan)
         if not np.isnan(v) and v > max_adc:
-            max_adc = v
-            max_sr = key
+            max_adc = v; max_sr = key
     if max_sr is None:
         return None
     kpa = max_adc * KPA_PER_UNIT
     nome = SR_NAMES.get(max_sr, max_sr)
-    return (max_sr, nome, kpa, payload["foot_side"])
+    return (max_sr, nome, kpa, payload["foot_side"], max_adc)
 
 def format_peak_lines(peaks):
     if not peaks:
         return "Maior pressão: —"
     lines = []
-    for sensor_id, nome, kpa, side in peaks:
+    for sensor_id, nome, kpa, side, _adc in peaks:
         lado = "Direito" if side == "right" else "Esquerdo"
         lines.append(f"{lado}: {nome} ({sensor_id}) — {kpa:.1f} kPa")
     return "Maior pressão:\n" + "\n".join(lines)
 
 # =========================
-# BASE: LEGENDA kPa + TELA CHEIA + QUADRO INFO
+# TICKS UNIFORMES (EXATOS) PARA A LEGENDA
+# =========================
+def make_ticks_exact(max_kpa: float, n_ticks: int = 6, decimals: int | None = None):
+    """
+    Gera n_ticks uniformemente espaçados de 0 até max_kpa (inclusive).
+    O último rótulo é exatamente o pico (max_kpa), sem arredondar.
+    """
+    if max_kpa is None or max_kpa <= 0:
+        max_kpa = 1.0
+    if decimals is None:
+        if max_kpa < 10: decimals = 1
+        elif max_kpa < 100: decimals = 1
+        else: decimals = 0
+    step = max_kpa / (n_ticks - 1)
+    ticks = [round(i * step, decimals) for i in range(n_ticks - 1)]
+    ticks.append(round(max_kpa, decimals))
+    return ticks
+
+# =========================
+# BASE: LEGENDA(S) + TELA CHEIA + QUADRO INFO
 # =========================
 class TelaBase(QWidget):
     def __init__(self, stack):
@@ -242,7 +223,7 @@ class TelaBase(QWidget):
         self.peak_box.setWordWrap(True)
         self.peak_box.setStyleSheet("""
             QLabel {
-                background-color: rgba(255,255,255,0.10);
+                background-color: rgba(0,0,0,0.25);
                 border: 1px solid rgba(255,255,255,0.25);
                 border-radius: 8px;
                 padding: 8px;
@@ -255,21 +236,36 @@ class TelaBase(QWidget):
         self.left_container.setLayout(self.left)
         self.layout.addWidget(self.left_container, 1)
 
-        # Direita (mapas + legenda)
-        self.img_vbox = QVBoxLayout()
+        # Direita (cada pé tem sua imagem e sua legenda)
         self.img_layout = QHBoxLayout()
+
+        # Caixa do pé ESQUERDO
+        self.left_box = QVBoxLayout()
         self.label_img_left = QLabel("");  self.label_img_left.setAlignment(Qt.AlignCenter)
+        self.legend_left = QLabel("")
+        self.legend_left.setAlignment(Qt.AlignCenter)
+        self.left_box.addWidget(self.label_img_left)
+        self.left_box.addWidget(self.legend_left)
+
+        # Caixa do pé DIREITO
+        self.right_box = QVBoxLayout()
         self.label_img_right = QLabel(""); self.label_img_right.setAlignment(Qt.AlignCenter)
-        self.img_layout.addWidget(self.label_img_left)
-        self.img_layout.addWidget(self.label_img_right)
-        self.img_vbox.addLayout(self.img_layout)
+        self.legend_right = QLabel("")
+        self.legend_right.setAlignment(Qt.AlignCenter)
+        self.right_box.addWidget(self.label_img_right)
+        self.right_box.addWidget(self.legend_right)
 
-        # Legenda com gradiente + marcas kPa (versão legível)
-        self.legend = QLabel()
-        self.legend.setPixmap(self._create_legend_kpa(420, 60))
-        self.img_vbox.addWidget(self.legend, alignment=Qt.AlignCenter)
+        self.img_layout.addLayout(self.left_box)
+        self.img_layout.addLayout(self.right_box)
+        self.layout.addLayout(self.img_layout, 3)
 
-        self.layout.addLayout(self.img_vbox, 3)
+        # Inicial: esconde as legendas até termos dados
+        self.legend_left.hide()
+        self.legend_right.hide()
+
+        # início com alguma barra padrão (opcional)
+        self._set_legend_pixmap(self.legend_left, 280.0)
+        self._set_legend_pixmap(self.legend_right, 280.0)
 
     def toggle_fullscreen(self):
         if self.fullscreen_btn.isChecked():
@@ -279,14 +275,51 @@ class TelaBase(QWidget):
             self.left_container.show()
             self.fullscreen_btn.setText("⛶ Tela Cheia")
 
-    def _create_legend_kpa(self, w=420, h=60):
+    # ------- Legendas individuais -------
+    def _set_legend_pixmap(self, legend_label: QLabel, max_kpa: float):
+        ticks = make_ticks_exact(max_kpa, n_ticks=6)
+        legend_label.setPixmap(self._create_legend_kpa(500, 70, ticks[-1], ticks))
+
+    def update_legends(self, max_left_kpa: float | None, max_right_kpa: float | None,
+                       show_left: bool, show_right: bool, view_mode: str):
+        """
+        Controla visibilidade e conteúdo das legendas.
+        - Se ambos: mostra as duas (cada uma com seu pico)
+        - Se só um pé: mostra apenas a respectiva, centralizada visualmente
+        """
+        # Reset
+        self.legend_left.hide()
+        self.legend_right.hide()
+
+        if view_mode == "Ambos" and show_left and show_right:
+            # ambas
+            if max_left_kpa is not None:
+                self._set_legend_pixmap(self.legend_left, max_left_kpa if max_left_kpa > 0 else 1.0)
+                self.legend_left.show()
+            if max_right_kpa is not None:
+                self._set_legend_pixmap(self.legend_right, max_right_kpa if max_right_kpa > 0 else 1.0)
+                self.legend_right.show()
+        else:
+            # somente um lado
+            if (view_mode == "Esquerdo" or not show_right) and show_left:
+                self._set_legend_pixmap(self.legend_left, (max_left_kpa or 1.0))
+                self.legend_left.show()
+            elif (view_mode == "Direito" or not show_left) and show_right:
+                self._set_legend_pixmap(self.legend_right, (max_right_kpa or 1.0))
+                self.legend_right.show()
+
+    # ------- Desenho da barra (genérica) -------
+    def _create_legend_kpa(self, w, h, max_kpa, ticks):
         """
         Barra de legenda (azul->vermelho) com marcas em kPa.
-        Margens laterais, fonte maior e fundo translúcido nos rótulos.
+        - Margens laterais p/ não cortar
+        - Fonte maior/negrito
+        - Fundo translúcido nos rótulos
+        - ESCALA DINÂMICA: 0 .. max_kpa (última marca é o pico exato)
         """
-        margin = 30            # margem lateral p/ evitar corte
-        grad_h = 20            # altura da barra colorida
-        pad_top = 10
+        margin = 30
+        grad_h = 22
+        pad_top = 12
         img = np.zeros((h, w, 3), dtype=np.uint8)
 
         # gradiente
@@ -299,24 +332,24 @@ class TelaBase(QWidget):
         qimg = QImage(img.data, w, h, 3*w, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
 
-        # ticks + texto
         painter = QPainter(pix)
         painter.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         pen = QPen(Qt.white); pen.setWidth(2)
         painter.setPen(pen)
-        font = QFont(); font.setPointSize(11); font.setBold(True)
+        font = QFont(); font.setPointSize(12); font.setBold(True)
         painter.setFont(font)
 
-        base_y = pad_top + grad_h
-        for kpa in LEGEND_TICKS_KPA:
-            frac = np.clip(kpa / LEGEND_MAX_KPA, 0, 1)
+        baseline = pad_top + grad_h
+        for kpa in ticks:
+            frac = np.clip(kpa / max_kpa, 0, 1) if max_kpa > 0 else 0
             x = int(margin + frac * (w - 2*margin - 1))
-            painter.drawLine(x, base_y, x, base_y + 6)
-            txt = f"{int(kpa)} kPa"
+            painter.drawLine(x, baseline, x, baseline + 7)
+
+            txt = f"{kpa:g} kPa"
             tw = painter.fontMetrics().horizontalAdvance(txt)
             th = painter.fontMetrics().height()
-            painter.fillRect(x - tw//2 - 3, h - th - 4, tw + 6, th, QColor(0, 0, 0, 160))
-            painter.drawText(x - tw//2, h - 6, txt)
+            painter.fillRect(x - tw//2 - 4, h - th - 4, tw + 8, th, QColor(0,0,0,180))
+            painter.drawText(x - tw//2, h - 7, txt)
 
         painter.end()
         return pix
@@ -406,17 +439,21 @@ class TelaEstatico(TelaBase):
         max_len=max(len(self.coletasR),len(self.coletasL))
         if max_len==0:
             self.status.setText(f"Data {self.date} | Sem coletas válidas")
-            self.set_peak_info([])
+            self.set_peak_info([]); self.update_legends(None, None, self.show_left, self.show_right, view_mode)
             return
 
         info_text=f"Data {self.date} | Coleta {self.idx+1}/{max_len}"
+        max_kpa_left = None
+        max_kpa_right = None
+
         if view_mode in ("Direito","Ambos") and self.show_right and self.idx<len(self.coletasR):
             payloadR=get_coleta(self.uid,self.date,self.coletasR[self.idx],"R")
             if payloadR:
                 self._draw_foot(payloadR)
                 info_text+=f" | Hora: {payloadR['timestamp']}"
                 mpR = max_pressure_info(payloadR)
-                if mpR: peaks.append(mpR)
+                if mpR:
+                    peaks.append(mpR); max_kpa_right = mpR[2]
 
         if view_mode in ("Esquerdo","Ambos") and self.show_left and self.idx<len(self.coletasL):
             payloadL=get_coleta(self.uid,self.date,self.coletasL[self.idx],"L")
@@ -424,10 +461,12 @@ class TelaEstatico(TelaBase):
                 self._draw_foot(payloadL)
                 info_text+=f" | Hora: {payloadL['timestamp']}"
                 mpL = max_pressure_info(payloadL)
-                if mpL: peaks.append(mpL)
+                if mpL:
+                    peaks.append(mpL); max_kpa_left = mpL[2]
 
         self.status.setText(info_text)
         self.set_peak_info(peaks)
+        self.update_legends(max_kpa_left, max_kpa_right, self.show_left, self.show_right, view_mode)
 
     def next_coleta(self):
         max_len=max(len(self.coletasR),len(self.coletasL))
@@ -459,8 +498,7 @@ class TelaMovimento(TelaBase):
         self.status=QLabel("Status: pronto"); self.left.addWidget(self.status)
 
         self.users=list_users()
-        for uid, nome in self.users:
-            self.combo_user.addItem(nome, uid)
+        for uid, nome in self.users: self.combo_user.addItem(nome, uid)
         self.combo_user.currentIndexChanged.connect(self.load_dates)
         btn_open.clicked.connect(self.open_heatmap)
         self.btn_prev.clicked.connect(self.prev_frame); self.btn_next.clicked.connect(self.next_frame)
@@ -510,27 +548,32 @@ class TelaMovimento(TelaBase):
         max_len = max(len(self.framesR), len(self.framesL))
         if max_len == 0:
             self.status.setText(f"Data {self.date} | Sem leituras válidas")
-            self.set_peak_info([])
+            self.set_peak_info([]); self.update_legends(None, None, self.show_left, self.show_right, view_mode)
             return
 
         info_text = f"Data {self.date} | Frame {self.idx+1}/{max_len}"
+        max_kpa_left = None
+        max_kpa_right = None
 
         if view_mode in ("Direito","Ambos") and self.show_right and self.idx < len(self.framesR):
             payloadR = self.framesR[self.idx]
             self._draw_foot(payloadR)
             info_text += f" | Hora: {payloadR['timestamp']}"
             mpR = max_pressure_info(payloadR)
-            if mpR: peaks.append(mpR)
+            if mpR:
+                peaks.append(mpR); max_kpa_right = mpR[2]
 
         if view_mode in ("Esquerdo","Ambos") and self.show_left and self.idx < len(self.framesL):
             payloadL = self.framesL[self.idx]
             self._draw_foot(payloadL)
             info_text += f" | Hora: {payloadL['timestamp']}"
             mpL = max_pressure_info(payloadL)
-            if mpL: peaks.append(mpL)
+            if mpL:
+                peaks.append(mpL); max_kpa_left = mpL[2]
 
         self.status.setText(info_text)
         self.set_peak_info(peaks)
+        self.update_legends(max_kpa_left, max_kpa_right, self.show_left, self.show_right, view_mode)
 
     def play(self):
         choice = self.speed_combo.currentIndex()
@@ -574,7 +617,6 @@ class MainWindow(QStackedWidget):
         self.addWidget(self.movimento)  # 2
         self.setCurrentIndex(0)
 
-        # Estilo global (degradê + botões + labels)
         self.setStyleSheet("""
             QWidget {
                 background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1,
@@ -588,17 +630,13 @@ class MainWindow(QStackedWidget):
                 padding: 8px;
                 border-radius: 6px;
             }
-            QPushButton:hover {
-                background-color: #3498db;
-            }
-            QLabel {
-                font-size: 14px;
-            }
+            QPushButton:hover { background-color: #3498db; }
+            QLabel { font-size: 14px; }
         """)
 
         self.setWindowIcon(QIcon(LOGO_IMG))
         self.setWindowTitle("NeuroSense")
-        self.resize(1300, 780)
+        self.resize(1400, 820)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
